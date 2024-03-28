@@ -1,0 +1,8 @@
+/build
+/.vscode
+
+*.app
+*.z64
+*.bin
+
+*.s
