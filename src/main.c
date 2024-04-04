@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
-#define MIN(a, b) (((a) < (b)) ? (b) : (a))
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
 volatile uint32_t *MI_HW_INTR_MASK = ((volatile uint32_t *)0xA430003C);
 
@@ -269,7 +269,7 @@ __get_type__exit:
 
 // clang-format off
 #define ERROR(msg, ...) { console_clear(); printf(msg __VA_OPT__(,) __VA_ARGS__); console_render(); }
-#define PANIC(msg, ...) { PANIC(msg __VA_OPT__(,) __VA_ARGS__); while (1); }
+#define PANIC(msg, ...) { ERROR(msg __VA_OPT__(,) __VA_ARGS__); while (1); }
 // clang-format on
 
 typedef struct {
@@ -277,6 +277,25 @@ typedef struct {
     ROMType type;
     Ticket *tikp;
 } Launchable;
+
+void setup_boot_params(void *data) {
+
+    *(volatile uint32_t *)0x80000300 = *(uint32_t *)(data + 0x30);
+    *(volatile uint32_t *)0x80000308 = *(uint32_t *)(data + 0x2C);
+    *(volatile uint32_t *)0x80000318 = *(uint32_t *)(data + 0x34);
+
+    *(volatile uint32_t *)0x8000035C = *(uint32_t *)(data + 0x00);
+    *(volatile uint32_t *)0x80000360 = *(uint32_t *)(data + 0x04);
+    *(volatile uint32_t *)0x80000364 = *(uint32_t *)(data + 0x08);
+    *(volatile uint32_t *)0x80000368 = *(uint32_t *)(data + 0x0C);
+    *(volatile uint32_t *)0x8000036C = *(uint32_t *)(data + 0x10);
+    *(volatile uint32_t *)0x80000370 = *(uint32_t *)(data + 0x14);
+    *(volatile uint32_t *)0x80000374 = *(uint32_t *)(data + 0x18);
+    *(volatile uint32_t *)0x80000378 = *(uint32_t *)(data + 0x1C);
+    *(volatile uint32_t *)0x8000037C = *(uint32_t *)(data + 0x20);
+    *(volatile uint32_t *)0x80000380 = *(uint32_t *)(data + 0x24);
+    *(volatile uint32_t *)0x80000384 = *(uint32_t *)(data + 0x28);
+}
 
 void launch(Launchable *rom) {
     int status;
@@ -292,6 +311,10 @@ void launch(Launchable *rom) {
     if (filename == NULL) {
         ERROR("Failed to retrieve filename for application\n");
         return;
+    }
+
+    if (rom->type == ROMTYPE_AES) {
+        rom->tikp->cmd.head.flags &= ~2;
     }
 
     status = exists("bbfs", "recrypt.sys", &recrypt_size);
@@ -329,8 +352,8 @@ void launch(Launchable *rom) {
 
     bundle = (bb_ticket_bundle_t){
         .ticket = rom->tikp,
-        .ticket_certs = NULL,
-        .ticket_cmd = NULL,
+        .ticket_certs = {NULL, NULL, NULL, NULL, NULL},
+        .ticket_cmd = {NULL, NULL, NULL, NULL, NULL},
     };
 
     if (skc_launch_setup(&bundle, NULL, recrypt_buf)) {
@@ -350,13 +373,20 @@ void launch(Launchable *rom) {
 
     nand_mmap_end();
 
-    entrypoint = (void*)io_read(0x10000008);
-    load_offset = (rom->tikp->cmd.head.flags & 2) ? 0x1000 : 0;
-    load_addr = entrypoint - load_offset;
+    entrypoint = (void *)io_read(0x10000008);
+    load_offset = (rom->tikp->cmd.head.flags & 2) ? 0 : 0x1000;
+    load_addr = entrypoint - (0x1000 - load_offset);
 
-    dma_read(load_addr, 0x10000000, MIN(rom->tikp->cmd.head.size, 1024 * 1024 + load_offset));
+    dma_read(load_addr, 0x10000000 + load_offset, MIN(rom->tikp->cmd.head.size - load_offset, 1024 * 1024 + (0x1000 - load_offset)));
 
-    
+    setup_boot_params(rom->tikp->cmd.desc);
+
+    data_cache_writeback_invalidate_all();
+    inst_cache_invalidate_all();
+
+    disable_interrupts();
+
+    skc_launch(entrypoint);
 
 __launch_err:
     free(filename);
