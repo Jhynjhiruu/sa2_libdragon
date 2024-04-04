@@ -153,13 +153,17 @@ int main(void) {
     printf("Line %d\n", __LINE__);
     console_render();
 
-    if (nand_mmap(0x10000000, blocks, NULL, NAND_MMAP_ENCRYPTED)) {
+    nand_mmap_begin();
+
+    if (nand_mmap(0x10000000, blocks, NAND_MMAP_ENCRYPTED)) {
         console_clear();
         printf("Error mapping file blocks\n");
         console_render();
         while (1)
             ;
     }
+
+    nand_mmap_end();
 
     printf("Line %d\n", __LINE__);
     console_render();
