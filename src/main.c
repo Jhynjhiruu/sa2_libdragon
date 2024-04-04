@@ -1,4 +1,7 @@
+#define _GNU_SOURCE
+
 #include <libdragon.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/errno.h>
@@ -141,15 +144,16 @@ ReadDirStatus read_dir(const char *const dir, direntry_t **out, unsigned int *co
 int exists(const char *const drive, const char *const filename, off_t *out) {
     struct stat stat_buf;
     char *name;
-    size_t num = snprintf(NULL, 0, "%s:/%s", drive, filename) + 1;
-    name = malloc(num);
-    if (name == NULL) {
+    int result;
+    if (asprintf(&name, "%s:/%s", drive, filename) < 0) {
         return -1;
     }
 
-    snprintf(name, num, "%s:/%s", drive, filename);
+    result = stat(name, &stat_buf);
 
-    if (stat(name, &stat_buf)) {
+    free(name);
+
+    if (result) {
         if (errno == ENOENT) {
             return 0;
         } else {
@@ -162,24 +166,270 @@ int exists(const char *const drive, const char *const filename, off_t *out) {
 }
 
 char *name_from_cid(uint32_t cid, const char *const ext) {
+    char *name;
     char ext_buf[4];
-
-    char *ret = malloc(8 + 1 + 3 + 1);
-    if (ret == NULL) {
-        return NULL;
-    }
 
     memcpy(ext_buf, ext, 3);
     ext_buf[3] = 0;
 
-    snprintf(ret, 8 + 1 + 3 + 1, "%08lx.%-3s", cid, ext_buf);
+    if (asprintf(&name, "%08lx.%-3s", cid, ext_buf) < 0) {
+        return NULL;
+    }
 
-    return ret;
+    return name;
+}
+
+typedef enum {
+    ROMTYPE_REC,
+    ROMTYPE_APP,
+    ROMTYPE_AES,
+    ROMTYPE_Z64,
+
+    ROMTYPE_NONE,
+} ROMType;
+
+char *name_from_cid_type(uint32_t cid, ROMType type) {
+    char *ext;
+
+    switch (type) {
+        case ROMTYPE_REC:
+            {
+                ext = "rec";
+                break;
+            }
+
+        case ROMTYPE_APP:
+            {
+                ext = "app";
+                break;
+            }
+
+        case ROMTYPE_AES:
+            {
+                ext = "aes";
+                break;
+            }
+
+        case ROMTYPE_Z64:
+            {
+                ext = "z64";
+                break;
+            }
+
+        default:
+            {
+                return NULL;
+            }
+    }
+
+    return name_from_cid(cid, ext);
+}
+
+ROMType get_type(uint32_t cid) {
+    ROMType type = ROMTYPE_NONE;
+    off_t size;
+
+    char *rec = name_from_cid_type(cid, ROMTYPE_REC);
+    char *app = name_from_cid_type(cid, ROMTYPE_APP);
+    char *aes = name_from_cid_type(cid, ROMTYPE_AES);
+    char *z64 = name_from_cid_type(cid, ROMTYPE_Z64);
+
+    if ((rec == NULL) || (app == NULL) || (aes == NULL) || (z64 == NULL)) {
+        goto __get_type__exit;
+    }
+
+    if (exists("bbfs", rec, &size) > 0) {
+        type = ROMTYPE_REC;
+        goto __get_type__exit;
+    }
+
+    if (exists("bbfs", app, &size) > 0) {
+        type = ROMTYPE_APP;
+        goto __get_type__exit;
+    }
+
+    if (exists("bbfs", aes, &size) > 0) {
+        type = ROMTYPE_AES;
+        goto __get_type__exit;
+    }
+
+    if (exists("bbfs", z64, &size) > 0) {
+        type = ROMTYPE_Z64;
+        goto __get_type__exit;
+    }
+
+__get_type__exit:
+    free(z64);
+    free(aes);
+    free(app);
+    free(rec);
+
+    return type;
 }
 
 // clang-format off
-#define PANIC(msg, ...) { console_clear(); printf(msg __VA_OPT__(,) __VA_ARGS__); console_render(); while (1); }
+#define ERROR(msg, ...) { console_clear(); printf(msg __VA_OPT__(,) __VA_ARGS__); console_render(); }
+#define PANIC(msg, ...) { PANIC(msg __VA_OPT__(,) __VA_ARGS__); while (1); }
 // clang-format on
+
+typedef struct {
+    uint32_t cid;
+    ROMType type;
+    Ticket *tikp;
+} Launchable;
+
+void launch(Launchable *rom) {
+    int status;
+    off_t recrypt_size;
+    uint8_t *recrypt_buf;
+    FILE *recrypt_file;
+    bb_ticket_bundle_t bundle;
+    int16_t *blocks;
+    void *entrypoint;
+    unsigned int load_offset;
+    void *load_addr;
+    char *filename = name_from_cid_type(rom->cid, rom->type);
+    if (filename == NULL) {
+        ERROR("Failed to retrieve filename for application\n");
+        return;
+    }
+
+    status = exists("bbfs", "recrypt.sys", &recrypt_size);
+    if (status < 0) {
+        ERROR("Error checking whether recrypt.sys exists: %d\n", errno);
+        free(filename);
+        return;
+    }
+
+    if (status == 0) {
+        ERROR("recrypt.sys does not exist\n");
+        free(filename);
+        return;
+    }
+
+    recrypt_buf = malloc(sizeof(uint8_t) * recrypt_size);
+    if (recrypt_buf == NULL) {
+        ERROR("Failed to allocate memory for recrypt.sys\n");
+        free(filename);
+        return;
+    }
+
+    recrypt_file = fopen("bbfs:/recrypt.sys", "r");
+    if (recrypt_file == NULL) {
+        ERROR("Failed to open recrypt.sys: %d\n", errno);
+        free(filename);
+        free(recrypt_buf);
+        return;
+    }
+
+    if (fread(recrypt_buf, sizeof(uint8_t), recrypt_size, recrypt_file) < 0) {
+        ERROR("Failed to read recrypt.sys\n");
+        goto __launch_err;
+    }
+
+    bundle = (bb_ticket_bundle_t){
+        .ticket = rom->tikp,
+        .ticket_certs = NULL,
+        .ticket_cmd = NULL,
+    };
+
+    if (skc_launch_setup(&bundle, NULL, recrypt_buf)) {
+        ERROR("Failed to set up launch\n");
+        goto __launch_err;
+    }
+
+    blocks = bbfs_get_file_blocks(filename);
+
+    nand_mmap_begin();
+
+    if (nand_mmap(0x10000000, blocks, NAND_MMAP_ENCRYPTED)) {
+        ERROR("Failed to set up ATB\n");
+        free(blocks);
+        goto __launch_err;
+    }
+
+    nand_mmap_end();
+
+    entrypoint = (void*)io_read(0x10000008);
+    load_offset = (rom->tikp->cmd.head.flags & 2) ? 0x1000 : 0;
+    load_addr = entrypoint - load_offset;
+
+    dma_read(load_addr, 0x10000000, MIN(rom->tikp->cmd.head.size, 1024 * 1024 + load_offset));
+
+    
+
+__launch_err:
+    free(filename);
+    free(recrypt_buf);
+    fclose(recrypt_file);
+}
+
+#define STICK_DIR_CUTOFF (64)
+
+void list_games(Launchable *roms, unsigned int num_roms) {
+    enum {
+        PrintList,
+        WaitInput,
+    } menu_state = PrintList;
+    unsigned int cursor_pos = 0;
+    bool run = true;
+    joypad_inputs_t inputs = {0}, prev_inputs;
+
+    joypad_init();
+
+    if (num_roms == 0) {
+        PANIC("No launchable applications found\n");
+    }
+
+    while (run) {
+        switch (menu_state) {
+            case PrintList:
+                {
+                    console_clear();
+                    for (unsigned int i = 0; i < num_roms; i++) {
+                        char *name = name_from_cid_type(roms[i].cid, roms[i].type);
+                        printf("%c %s\n", (i == cursor_pos) ? '>' : ' ', name);
+                        free(name);
+                    }
+                    console_render();
+
+                    menu_state = WaitInput;
+
+                    break;
+                }
+
+            case WaitInput:
+                {
+                    bool changed = false;
+
+                    joypad_poll();
+
+                    prev_inputs = inputs;
+                    inputs = joypad_get_inputs(0);
+
+                    if ((inputs.stick_y < -STICK_DIR_CUTOFF) && !(prev_inputs.stick_y < -STICK_DIR_CUTOFF) && (cursor_pos < (num_roms - 1))) {
+                        cursor_pos += 1;
+                        changed = true;
+                    }
+
+                    if ((inputs.stick_y > STICK_DIR_CUTOFF) && !(prev_inputs.stick_y > STICK_DIR_CUTOFF) && (cursor_pos > 0)) {
+                        cursor_pos -= 1;
+                        changed = true;
+                    }
+
+                    if ((inputs.btn.a) && !(prev_inputs.btn.a)) {
+                        launch(&roms[cursor_pos]);
+                    }
+
+                    if (changed) {
+                        menu_state = PrintList;
+                    }
+
+                    break;
+                }
+        }
+    }
+}
 
 int main(void) {
     off_t ticket_size;
@@ -188,6 +438,8 @@ int main(void) {
     uint8_t *ticket_buf;
     uint32_t num_tickets;
     Ticket *tickets;
+    Launchable *roms;
+    unsigned int rom_index;
 
     char fname_buf[100];
 
@@ -224,37 +476,20 @@ int main(void) {
     num_tickets = *(uint32_t *)ticket_buf;
     tickets = (Ticket *)(ticket_buf + 4);
 
+    roms = malloc(sizeof(Launchable) * num_tickets);
+    rom_index = 0;
+
     for (uint32_t i = 0; i < num_tickets; i++) {
-        off_t size;
+        uint32_t cid = tickets[i].cmd.head.cid;
+        ROMType type = get_type(cid);
 
-        char *rec = name_from_cid(tickets[i].cmd.head.cid, "rec");
-        if (rec == NULL) {
-            PANIC("Failed to format rec name\n");
+        if (type != ROMTYPE_NONE) {
+            roms[rom_index++] = (Launchable){.cid = cid, .type = type, .tikp = &tickets[i]};
         }
-
-        if (exists("bbfs", rec, &size) > 0) {
-            printf("%s\n", rec);
-        } else {
-            char *app = name_from_cid(tickets[i].cmd.head.cid, "app");
-            if (app == NULL) {
-                PANIC("Failed to format app name\n");
-            }
-
-            if (exists("bbfs", app, &size) > 0) {
-                printf("%s\n", app);
-            } else {
-                char *aes = name_from_cid(tickets[i].cmd.head.cid, "aes");
-                if (aes == NULL) {
-                    PANIC("Failed to format aes name\n");
-                }
-
-                if (exists("bbfs", aes, &size) > 0) {
-                    printf("%s\n", aes);
-                }
-                free(aes);
-            }
-            free(app);
-        }
-        free(rec);
     }
+
+    list_games(roms, rom_index);
+
+    while (1)
+        ;
 }
