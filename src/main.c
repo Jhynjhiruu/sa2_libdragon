@@ -323,7 +323,8 @@ void setup_boot_params(void *data, bool use_cheats) {
 #define CODE_HANDLER (0x80500000)
 #define CODE_HANDLER_END (0x80600000)
 
-#define INTR_HANDLER (0x800002C0)
+// #define INTR_HANDLER (0x800002C0)
+#define INTR_HANDLER (0x80000204)
 #define WATCH_HANDLER (0x807FF000)
 
 #define MI_INTR ((uint32_t)MI_INTERRUPT)
@@ -331,7 +332,7 @@ void setup_boot_params(void *data, bool use_cheats) {
 void setup_cheats(void) {
     const uint32_t intr_entry[] = {
         0x3C1A0000 | ((INTR_HANDLER >> 16) & 0xFFFF), // lui $k0, %HI(INTR_HANDLER)
-        0x375A02C0 | (INTR_HANDLER & 0xFFFF),         // ori $k0, $k0, %LO(INTR_HANDLER)
+        0x375A0000 | (INTR_HANDLER & 0xFFFF),         // ori $k0, $k0, %LO(INTR_HANDLER)
         0x03400008,                                   // jr  $k0
         0x00000000,                                   //  nop
     };
@@ -348,23 +349,45 @@ void setup_cheats(void) {
     memcpy((void *)WATCH_ENTRY, watch_entry, sizeof(watch_entry));
 
     const uint32_t intr_handler[] = {
-        0x401A6800,                                      //  mfc0 $k0, Cause
-        0x341B0000 | (EXCEPTION_CODE_WATCH << 2),        //  ori  $k1, $zero, (EXCEPTION_CODE_WATCH << 2)
-        0x335A007C,                                      //  andi $k0, $k0,   0x007C
-        0x135B0009,                                      //  beq  $k0, $k1,   2f
-        0x00000000,                                      //   nop
-        0x17400005,                                      //  bnez $k0,        1f
-        0x3C1A0000 | ((MI_INTR >> 16) & 0xFFFF),         //   lui $k0, %HI(MI_INTERRUPT)
-        0x8F5A0000 | (MI_INTR & 0xFFFF),                 //  lw   $k0, %LO(MI_INTERRUPT)($k0)
-        0x335B0000 | (MI_INTERRUPT_SI),                  //  andi $k1, $k0,   MI_INTERRUPT_SI
-        0x17600001,                                      //  bnez $k1,        1f
-        0x00000000,                                      //   nop
-                                                         // 1:
-        0x08000000 | ((CODE_HANDLER & 0x0FFFFFFF) >> 2), //  j CODE_HANDLER
-        0x00000000,                                      //   nop
-                                                         // 2:
-        0x08000000 | ((WATCH_ENTRY & 0x0FFFFFFF) >> 2),  //  j WATCH_ENTRY
-        0x00000000,                                      //   nop
+        0x401A6800,                                        //  mfc0  $k0, Cause
+        0x335A007C,                                        //  andi  $k0, $k0,   0x007C
+        0x341B0000 | (EXCEPTION_CODE_FLOATING_POINT << 2), //  ori   $k1, $zero, (EXCEPTION_CODE_FLOATING_POINT << 2)
+        0x135B000E,                                        //  beq   $k0, $k1,   3f
+        0x00000000,                                        //   nop
+        0x341B0000 | (EXCEPTION_CODE_WATCH << 2),          //  ori   $k1, $zero, (EXCEPTION_CODE_WATCH << 2)
+        0x135B0009,                                        //  beq   $k0, $k1,   2f
+        0x00000000,                                        //   nop
+        0x17400005,                                        //  bnez  $k0,        1f
+        0x3C1A0000 | ((MI_INTR >> 16) & 0xFFFF),           //   lui  $k0, %HI(MI_INTERRUPT)
+        0x8F5A0000 | (MI_INTR & 0xFFFF),                   //  lw    $k0, %LO(MI_INTERRUPT)($k0)
+        0x335B0000 | (MI_INTERRUPT_SI),                    //  andi  $k1, $k0,   MI_INTERRUPT_SI
+        0x17600001,                                        //  bnez  $k1,        1f
+        0x00000000,                                        //   nop
+                                                           // 1:
+        0x08000000 | ((CODE_HANDLER & 0x0FFFFFFF) >> 2),   //  j CODE_HANDLER
+        0x00000000,                                        //   nop
+                                                           // 2:
+        0x08000000 | ((WATCH_ENTRY & 0x0FFFFFFF) >> 2),    //  j WATCH_ENTRY
+        0x00000000,                                        //   nop
+                                                           // 3:
+        0x445AF800,                                        //  cfc1  $k0, FCR31
+        0x3C1BFFFC,                                        //  lui   $k1, 0xFFFC
+        0x377B0FFF,                                        //  ori   $k1, $k1,   0x0FFF
+        0x035BD024,                                        //  and   $k0, $k0,   $k1
+        0x44DAF800,                                        //  ctc1  $k0, FCR31
+        0x00000000,                                        //   nop
+        0x401A7000,                                        //  mfc0  $k0, EPC
+        0x00000000,                                        //   nop
+        0x275A0004,                                        //  addiu $k0, $k0,   4
+        0x409A7000,                                        //  mtc0  $k0, EPC
+        0x00000000,                                        //   nop
+        0x401AF000,                                        //  mfc0  $k0, ErrorEPC
+        0x00000000,                                        //   nop
+        0x275A0004,                                        //  addiu $k0, $k0,   4
+        0x409AF000,                                        //  mtc0  $k0, ErrorEPC
+        0x00000000,                                        //   nop
+        0x42000018,                                        //  eret
+        0x00000000,                                        //   nop
     };
 
     /*const uint32_t intr_handler[] = {
