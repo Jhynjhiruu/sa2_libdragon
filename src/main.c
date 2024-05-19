@@ -100,45 +100,63 @@ bb_ticket_bundle_t bundle = {
 };
 
 typedef struct {
-    uint32_t type;
+    off_t size;
     char filename[8 + 1 + 3 + 1]; // 8.3 + null terminator
 } direntry_t;
+
+typedef struct {
+    direntry_t *files;
+    unsigned int count;
+} directory_t;
 
 typedef enum {
     READDIR_SUCCESS = 0,
     READDIR_NOMEM,
     READDIR_LISTFAILED,
+    READDIR_STATFAILED,
 } ReadDirStatus;
 
-ReadDirStatus read_dir(const char *const dir, direntry_t **out, unsigned int *count) {
+ReadDirStatus read_dir(const char *const dir, directory_t *out) {
     dir_t buf;
+    struct stat sb;
+    char *fname;
     int status;
 
-    *count = 0;
-    *out = malloc(1);
-    if (*out == NULL) {
+    out->count = 0;
+    out->files = malloc(1);
+    if (out->files == NULL) {
         return READDIR_NOMEM;
     }
 
     status = dir_findfirst(dir, &buf);
     if (status != 0) {
-        free(*out);
+        free(out->files);
         return READDIR_LISTFAILED;
     }
 
     while (status == 0) {
-        direntry_t *temp = realloc(*out, sizeof(direntry_t) * (*count + 1));
+        direntry_t *temp = realloc(out->files, sizeof(direntry_t) * (out->count + 1));
         if (temp == NULL) {
-            free(*out);
+            free(out->files);
             return READDIR_NOMEM;
         }
 
-        *out = temp;
+        out->files = temp;
 
-        (*out)[*count].type = buf.d_type;
-        strncpy((*out)[*count].filename, buf.d_name, 8 + 1 + 3 + 1);
+        strncpy((out->files)[out->count].filename, buf.d_name, 8 + 1 + 3 + 1);
 
-        (*count)++;
+        asprintf(&fname, "%s%s", dir, (out->files)[out->count].filename);
+
+        if (stat(fname, &sb) != 0) {
+            free(fname);
+            free(out->files);
+            return READDIR_STATFAILED;
+        }
+
+        free(fname);
+        (out->files)[out->count].size = sb.st_size;
+
+        (out->count)++;
 
         status = dir_findnext(dir, &buf);
     }
@@ -146,30 +164,18 @@ ReadDirStatus read_dir(const char *const dir, direntry_t **out, unsigned int *co
     return READDIR_SUCCESS;
 }
 
-int exists(const char *const drive, const char *const filename, off_t *out) {
-    struct stat stat_buf;
-    char *name;
-    int result;
-    if (asprintf(&name, "%s:/%s", drive, filename) < 0) {
-        ERROR("Failed to determine drive filename\n");
-        return -1;
-    }
+directory_t global_dir;
 
-    result = stat(name, &stat_buf);
-
-    free(name);
-
-    if (result) {
-        result = errno;
-        if ((result == ENOENT) || (result == EBADF) || (result == EINVAL)) {
-            return 0;
-        } else {
-            return -result;
+int exists(const char *const filename, off_t *out) {
+    for (unsigned int i = 0; i < global_dir.count; i++) {
+        if (strcasecmp(global_dir.files[i].filename, filename) == 0) {
+            if (out) {
+                *out = global_dir.files[i].size;
+            }
+            return 1;
         }
-    } else {
-        *out = stat_buf.st_size;
-        return 1;
     }
+    return 0;
 }
 
 char *name_from_cid(uint32_t cid, const char *const ext) {
@@ -252,22 +258,22 @@ ROMType get_type(uint32_t cid) {
         goto __get_type__exit;
     }
 
-    if (exists("bbfs", z64, &size) > 0) {
+    if (exists(z64, &size) > 0) {
         type = ROMTYPE_Z64;
         goto __get_type__exit;
     }
 
-    if (exists("bbfs", aes, &size) > 0) {
+    if (exists(aes, &size) > 0) {
         type = ROMTYPE_AES;
         goto __get_type__exit;
     }
 
-    if (exists("bbfs", app, &size) > 0) {
+    if (exists(app, &size) > 0) {
         type = ROMTYPE_APP;
         goto __get_type__exit;
     }
 
-    if (exists("bbfs", rec, &size) > 0) {
+    if (exists(rec, &size) > 0) {
         type = ROMTYPE_REC;
         goto __get_type__exit;
     }
@@ -504,46 +510,60 @@ void parse_codes(uint8_t *cheat_buf, off_t cheats_size) {
     uint32_t *const code = UncachedAddr(CODE_HANDLER);
     size_t code_index = 0;
     size_t cheat = 0;
+    uint32_t *branch_loc = 0;
 
     // clang-format off
-#define NEXT_CHEAT(ident) if (cheat >= num_cheats) {break;} Cheat ident = {.type = cheat_type(cheat_buf, cheat), .addr = cheat_addr(cheat_buf, cheat), .extra = cheat_extra(cheat_buf, cheat)}; cheat++
+#define NEXT_CHEAT(ident) if (cheat >= num_cheats) {break;} const Cheat ident = {.type = cheat_type(cheat_buf, cheat), .addr = cheat_addr(cheat_buf, cheat), .extra = cheat_extra(cheat_buf, cheat)}; cheat++
     // clang-format on
 
     while (((void *)&code[code_index] < UncachedAddr(CODE_HANDLER_END)) && (cheat < num_cheats)) {
         NEXT_CHEAT(cur);
+        const bool is_16_bit = (cur.type & (1 << 0)) && !(cur.addr & (1 << 0));
+        const bool cond_inv = cur.type & (1 << 1);
 
         if ((cur.type == 0) && (cur.addr == 0) && (cur.extra == 0)) {
             break;
         }
-        printf("cheat %02X%06lX %04X\n", cur.type, cur.addr, cur.extra);
-        console_render();
 
         if ((cur.type & 0xF0) == 0xD0) {
             // 8-bit / 16-bit equal-to / not-equal-to
 
-            code[code_index++] = 0x3C1A8000 | (cur.addr >> 16);                                              // lui   $k0, %HI(cur.addr) | 0x8000
-            code[code_index++] = 0x375A0000 | (cur.addr & 0xFFFF);                                           // ori   $k0, $k0,   %LO(cur.addr)
-            code[code_index++] = ((cur.type & (1 << 0)) & !(cur.addr & (1 << 0))) ? 0x875A0000 : 0x835A0000; // lh    $k0, 0($k0) : lb    $k0, 0($k0)
-            code[code_index++] = 0x241B0000 | (cur.extra);                                                   // addiu $k1, $zero, cur.extra
-            code[code_index++] = (cur.type & (1 << 1)) ? 0x135B0004 : 0x175B0004;                            // beq   $k0, $k1,   4 : bne   $k0, $k1,   4
+            code[code_index++] = 0x3C1A8000 | (cur.addr >> 16);                               // lui   $k0, %HI(cur.addr) | 0x8000
+            code[code_index++] = (is_16_bit ? 0x875A0000 : 0x835A0000) | (cur.addr & 0xFFFF); // lh    $k0, %LO(cur.addr)($k0) : lb    $k0, %LO(cur.addr)($k0)
+            code[code_index++] = 0x241B0000 | (cur.extra);                                    // addiu $k1, $zero, cur.extra
+
+            if (branch_loc != 0) {
+                *branch_loc |= (uint32_t)(&code[code_index + 1] - branch_loc) >> 2;
+            }
+
+            branch_loc = &code[code_index];
+            code[code_index++] = cond_inv ? 0x135B0004 : 0x175B0004; // beq   $k0, $k1,   next_code : bne   $k0, $k1,   next_code
         } else if ((cur.type & 0xF0) == 0x80) {
             // 8-bit / 16-bit cached store
 
-            code[code_index++] = 0x3C1A8000 | (cur.addr >> 16);                                              // lui   $k0, %HI(cur.addr) | 0x8000
-            code[code_index++] = 0x375A0000 | (cur.addr & 0xFFFF);                                           // ori   $k0, $k0,   %LO(cur.addr)
-            code[code_index++] = 0x241B0000 | (cur.extra);                                                   // addiu $k1, $zero, cur.extra
-            code[code_index++] = ((cur.type & (1 << 0)) & !(cur.addr & (1 << 0))) ? 0xA75B0000 : 0xA35B0000; // sh    $k1, 0($k0) : sb    $k1, 0($k0)
+            code[code_index++] = 0x3C1A8000 | (cur.addr >> 16);                               // lui   $k0, %HI(cur.addr) | 0x8000
+            code[code_index++] = 0x241B0000 | (cur.extra);                                    // addiu $k1, $zero, cur.extra
+            code[code_index++] = (is_16_bit ? 0xA75B0000 : 0xA35B0000) | (cur.addr & 0xFFFF); // sh    $k1, %LO(cur.addr)($k0) : sb    $k1, %LO(cur.addr)($k0)
+
+            if (branch_loc != 0) {
+                *branch_loc |= (uint32_t)(&code[code_index] - branch_loc) >> 2;
+                branch_loc = 0;
+            }
         } else if ((cur.type & 0xF0) == 0xA0) {
             // 8-bit / 16-bit uncached store
 
-            code[code_index++] = 0x3C1AA000 | (cur.addr >> 16);                                              // lui   $k0, %HI(cur.addr) | 0xA000
-            code[code_index++] = 0x375A0000 | (cur.addr & 0xFFFF);                                           // ori   $k0, $k0,   %LO(cur.addr)
-            code[code_index++] = 0x241B0000 | (cur.extra);                                                   // addiu $k1, $zero, cur.extra
-            code[code_index++] = ((cur.type & (1 << 0)) & !(cur.addr & (1 << 0))) ? 0xA75B0000 : 0xA35B0000; // sh    $k1, 0($k0) : sb    $k1, 0($k0)
+            code[code_index++] = 0x3C1AA000 | (cur.addr >> 16);                               // lui   $k0, %HI(cur.addr) | 0xA000
+            code[code_index++] = 0x241B0000 | (cur.extra);                                    // addiu $k1, $zero, cur.extra
+            code[code_index++] = (is_16_bit ? 0xA75B0000 : 0xA35B0000) | (cur.addr & 0xFFFF); // sh    $k1, %LO(cur.addr)($k0) : sb    $k1, %LO(cur.addr)($k0)
+
+            if (branch_loc != 0) {
+                *branch_loc |= (uint32_t)(&code[code_index] - branch_loc) >> 2;
+                branch_loc = 0;
+            }
         } else if ((cur.type & 0xF0) == 0xF0) {
             // 8-bit / 16-bit write on boot
 
-            if ((cur.type & (1 << 0)) & !(cur.addr & (1 << 0))) {
+            if (is_16_bit) {
                 *(uint16_t *)UncachedAddr(KSEG0_START_ADDR + cur.addr) = cur.extra;
             } else {
                 *(uint8_t *)UncachedAddr(KSEG0_START_ADDR + cur.addr) = cur.extra;
@@ -558,7 +578,6 @@ void parse_codes(uint8_t *cheat_buf, off_t cheats_size) {
 }
 
 void launch(Launchable *rom, bool use_cheats) {
-    int status;
     off_t recrypt_size;
     uint8_t *recrypt_buf;
     FILE *recrypt_file;
@@ -640,15 +659,7 @@ void launch(Launchable *rom, bool use_cheats) {
         rom->tikp->cmd.head.flags &= ~2;
     }
 
-    status = exists("bbfs", "recrypt.sys", &recrypt_size);
-    if (status < 0) {
-        ERROR("Error checking whether recrypt.sys exists: %d\n", errno);
-        free(filename);
-        free(cheat_buf);
-        return;
-    }
-
-    if (status == 0) {
+    if (exists("recrypt.sys", &recrypt_size) == 0) {
         ERROR("recrypt.sys does not exist\n");
         free(filename);
         free(cheat_buf);
@@ -811,10 +822,12 @@ int main(void) {
     Ticket *tickets;
     Launchable *roms;
     unsigned int rom_index;
+    ReadDirStatus dir_status;
 
     char fname_buf[100];
 
     *MI_HW_INTR_MASK = (1 << 25);
+    //*((volatile uint32_t *)0xA480001C) |= (1 << 31);
 
     console_init();
 
@@ -824,7 +837,12 @@ int main(void) {
         PANIC("Error initialising BBFS\n");
     }
 
-    status = exists("bbfs", "ticket.sys", &ticket_size);
+    dir_status = read_dir("bbfs:/", &global_dir);
+    if (dir_status != READDIR_SUCCESS) {
+        PANIC("Error listing directory: %d\n", dir_status);
+    }
+
+    status = exists("ticket.sys", &ticket_size);
     if (status < 0) {
         PANIC("Error checking whether ticket.sys exists: %d\n", errno);
     }
@@ -848,6 +866,9 @@ int main(void) {
     tickets = (Ticket *)(ticket_buf + 4);
 
     roms = malloc(sizeof(Launchable) * num_tickets);
+    if (roms == NULL) {
+        PANIC("Failed to allocate ROMs\n");
+    }
     rom_index = 0;
 
     for (uint32_t i = 0; i < num_tickets; i++) {
@@ -861,14 +882,9 @@ int main(void) {
             if (cht == NULL) {
                 ERROR("Failed to determine name of cheat file\n");
             } else {
-                off_t size;
-                status = exists("bbfs", cht, &size);
+                status = exists(cht, NULL);
 
-                if (status < 0) {
-                    ERROR("Failed to stat cheat file %s: %d\n", cht, -status);
-                } else {
-                    rom.has_cht = (status > 0);
-                }
+                rom.has_cht = (status > 0);
 
                 free(cht);
             }
