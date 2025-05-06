@@ -829,6 +829,14 @@ int main(void) {
     *MI_HW_INTR_MASK = (1 << 25);
     //*((volatile uint32_t *)0xA480001C) |= (1 << 31);
 
+    void reset_handler(void) {
+        *(volatile uint32_t *)(0xA4600060) = ((*(volatile uint32_t *)(0xA4600060) | (1 << 4)) & ~(1 << 0)) | (0 << 0);
+    }
+
+    register_RESET_handler(reset_handler);
+    set_BB_BTN_interrupt(true);
+    set_RESET_interrupt(true);
+
     console_init();
 
     console_set_render_mode(RENDER_MANUAL);
